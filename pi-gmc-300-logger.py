@@ -6,7 +6,6 @@ import threading
 import time
 import csv
 from datetime import datetime
-import struct
 
 # Conversion factor for CPM to µSv/h
 def convert_cpm_to_usvh(cpm):
