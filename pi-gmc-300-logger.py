@@ -8,9 +8,7 @@ import csv
 from datetime import datetime
 import struct
 
-# Set this flag to True to see debug messages.
-DEBUG = False
-
+# Conversion factor for CPM to µSv/h
 def convert_cpm_to_usvh(cpm):
     return cpm * 0.0065
 
@@ -19,8 +17,8 @@ GPS_COORDS = "53.4096, -2.5737"
 
 # Global lock for thread-safe serial writes
 serial_lock = threading.Lock()
-# Global variable for the latest battery voltage
-last_batt_voltage = None
+# Global variable for the latest battery voltage (default to 0.0)
+last_batt_voltage = 0.0
 
 def initialize_csv(filename):
     try:
@@ -32,15 +30,15 @@ def initialize_csv(filename):
         pass
 
 def log_data(filename, timestamp, cpm, usvh, batt_voltage, device_serial, device_version):
-    # If batt_voltage is a number, format it; otherwise, log as blank.
-    if isinstance(batt_voltage, (int, float)):
-        batt_str = f"{batt_voltage:.2f}"
-    else:
-        batt_str = ""
+    # If batt_voltage is not a number, default to 0.0.
+    if not isinstance(batt_voltage, (int, float)):
+        batt_voltage = 0.0
+    batt_str = f"{batt_voltage:.2f}"
     with open(filename, 'a', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([timestamp.isoformat(), cpm, usvh, batt_str, GPS_COORDS, device_serial, device_version])
-    # (Debug) if DEBUG: print(f"Logged: {timestamp.isoformat()}, CPM: {cpm}, uSv/h: {usvh:.2f}, Batt: {batt_str} V, Serial: {device_serial}, Version: {device_version}")
+    # Minimal terminal output for logging; remove or comment out the next line if desired.
+    # print(f"Logged: {timestamp.isoformat()}, CPM: {cpm}, uSv/h: {usvh:.2f}, Batt: {batt_str} V, Serial: {device_serial}, Version: {device_version}")
 
 def get_serial_port():
     ports = serial.tools.list_ports.comports()
@@ -78,13 +76,12 @@ def set_device_datetime(ser):
     cmd = f"<SETDATETIME{YY}{MM}{DD}{hh}{mm}{ss}>>"
     with serial_lock:
         ser.write(cmd.encode())
-    if DEBUG:
-        print(f"Set device datetime with command: {cmd}")
+    print(f"Set device datetime with command: {cmd}")
 
 def sync_time_loop(ser):
     while ser.is_open:
         set_device_datetime(ser)
-        time.sleep(1800)  # Sync every 30 minutes
+        time.sleep(1800)  # 30 minutes
 
 def read_battery_voltage_loop(ser):
     global last_batt_voltage
@@ -97,19 +94,20 @@ def read_battery_voltage_loop(ser):
             response = ser.read(1)
             if len(response) == 1:
                 voltage = response[0] / 10.0
+                # For a LiPo AAA cell, expect voltage below 5V.
                 if voltage > 5.0:
-                    if DEBUG:
-                        print(f"Invalid battery voltage reading: {voltage:.2f} V; ignoring.")
+                    print(f"Invalid battery voltage reading: {voltage:.2f} V; setting to 0.0 V.")
+                    last_batt_voltage = 0.0
                 else:
                     last_batt_voltage = voltage
-                    if DEBUG:
-                        print(f"Battery Voltage: {voltage:.2f} V")
+                    # Uncomment next line for debug: print(f"Battery Voltage: {voltage:.2f} V")
             else:
-                if DEBUG:
-                    print("Incomplete battery voltage data")
+                print("Incomplete battery voltage data; setting battery voltage to 0.0 V.")
+                last_batt_voltage = 0.0
         except Exception as e:
             print("Error in battery voltage loop:", e)
-        time.sleep(60)  # Poll every 60 seconds
+            last_batt_voltage = 0.0
+        time.sleep(60)  # Poll battery voltage every 60 seconds
 
 def read_cpm_loop(ser, device_serial, device_version):
     while ser.is_open:
@@ -118,27 +116,27 @@ def read_cpm_loop(ser, device_serial, device_version):
             with serial_lock:
                 ser.write(b'<GETCPM>>')
             time.sleep(2)
-            response = ser.read_all()
-            if DEBUG:
-                print(f"[CPM Raw bytes]: {response}")
+            # Try to read exactly 2 bytes (or 3 if an extra marker is present)
+            response = ser.read(2)
+            if len(response) < 2:
+                extra = ser.read(1)
+                response += extra
+            print(f"[CPM Raw bytes]: {response}")
             if response:
                 if len(response) >= 2:
                     valid_response = response[:2]
                     cpm_value = int.from_bytes(valid_response, byteorder='big') & 0x3FFF
                     usvh = convert_cpm_to_usvh(cpm_value)
                     timestamp = datetime.now()
-                    batt_voltage = last_batt_voltage if last_batt_voltage is not None else ""
+                    batt_voltage = last_batt_voltage if last_batt_voltage is not None else 0.0
                     log_data(CSV_FILENAME, timestamp, cpm_value, round(usvh, 2), batt_voltage, device_serial, device_version)
                 elif len(response) == 1:
                     if response == b'\xaa':
-                        if DEBUG:
-                            print("Ignoring marker byte 0xAA")
+                        print("Ignoring marker byte 0xAA")
                     else:
-                        if DEBUG:
-                            print("Unexpected 1-byte response:", response)
+                        print("Unexpected 1-byte response:", response)
             else:
-                if DEBUG:
-                    print("No CPM data received")
+                print("No CPM data received")
         except Exception as e:
             print("Error in CPM loop:", e)
             break
@@ -150,23 +148,24 @@ def main():
     if port is None:
         print("No serial port found. Ensure the device is connected.")
         return
+    print(f"Using serial port: {port}")
     try:
         ser = serial.Serial(port, 57600, timeout=1,
                             parity=serial.PARITY_NONE,
                             bytesize=serial.EIGHTBITS,
                             stopbits=serial.STOPBITS_ONE)
         time.sleep(2)
-        device_version = get_device_version(ser)
-        device_serial = get_device_serial_number(ser)
+        print(f"Connected to {port}")
 
-        # Start automatic time synchronization thread
+        device_version = get_device_version(ser)
+        print(f"Device version: {device_version}")
+        device_serial = get_device_serial_number(ser)
+        print(f"Device serial number: {device_serial}")
+
         threading.Thread(target=sync_time_loop, args=(ser,), daemon=True).start()
-        # Start battery voltage polling thread
         threading.Thread(target=read_battery_voltage_loop, args=(ser,), daemon=True).start()
-        # Start CPM reading loop thread
         threading.Thread(target=read_cpm_loop, args=(ser, device_serial, device_version), daemon=True).start()
 
-        # Keep the main thread alive indefinitely.
         while True:
             time.sleep(1)
     except Exception as e:
